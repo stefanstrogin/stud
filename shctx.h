@@ -9,7 +9,11 @@
 
 #ifndef SHCTX_H
 #define SHCTX_H
+#ifdef USE_WOLFSSL
+#include <wolfssl/openssl/ssl.h>
+#else
 #include <openssl/ssl.h>
+#endif
 #include <stdint.h>
 
 #ifndef SHSESS_MAX_FOOTER_LEN

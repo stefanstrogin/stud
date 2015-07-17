@@ -6,10 +6,20 @@ DESTDIR =
 PREFIX  = /usr/local
 BINDIR  = $(PREFIX)/bin
 MANDIR  = $(PREFIX)/share/man
+# WolfSSL should be built with --enable-lighty and --enable-opensslextra
+#LIBSSL = wolfssl
 
-CFLAGS  = -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -D_GNU_SOURCE -I/usr/local/include
-LDFLAGS = -lssl -lcrypto -lev -L/usr/local/lib
+CFLAGS  = -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -D_GNU_SOURCE -I/usr/local/include 
+LDFLAGS = -lev -L/usr/local/lib
 OBJS    = stud.o ringbuffer.o configuration.o
+
+ifeq ($(LIBSSL),wolfssl)
+LDFLAGS += -lwolfssl
+CFLAGS += -DOPENSSL_NO_DH -DHAVE_LIGHTY -DOPENSSL_EXTRA -DUSE_WOLFSSL
+else
+LDFLAGS += -lssl -lcrypto
+endif
+
 
 all: realall
 

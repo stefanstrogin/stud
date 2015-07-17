@@ -53,6 +53,16 @@
 #include <sched.h>
 #include <signal.h>
 
+#ifdef USE_WOLFSSL
+#include <wolfssl/openssl/ssl.h>
+#include <wolfssl/openssl/x509.h>
+#include <wolfssl/openssl/x509v3.h>
+#include <wolfssl/openssl/x509.h>
+#include <wolfssl/openssl/err.h>
+#include <wolfssl/openssl/engine.h>
+#include <wolfssl/openssl/crypto.h>
+#include <wolfssl/openssl/opensslv.h>
+#else
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
@@ -60,6 +70,8 @@
 #include <openssl/err.h>
 #include <openssl/engine.h>
 #include <openssl/asn1.h>
+#endif
+
 #include <ev.h>
 
 #include "ringbuffer.h"
@@ -535,8 +547,6 @@ static int create_shcupd_socket() {
     return s;
 }
 
-#endif /*USE_SHARED_CACHE */
-
 RSA *load_rsa_privatekey(SSL_CTX *ctx, const char *file) {
     BIO *bio;
     RSA *rsa;
@@ -553,6 +563,8 @@ RSA *load_rsa_privatekey(SSL_CTX *ctx, const char *file) {
 
     return rsa;
 }
+
+#endif /*USE_SHARED_CACHE */
 
 #ifndef OPENSSL_NO_TLSEXT
 /*
@@ -588,7 +600,9 @@ int sni_switch_ctx(SSL *ssl, int *al, void *data) {
 
 SSL_CTX *make_ctx(const char *pemfile) {
     SSL_CTX *ctx;
+#ifdef USE_SHARED_CACHE
     RSA *rsa;
+#endif
 
     long ssloptions = SSL_OP_NO_SSLv2 | SSL_OP_ALL |
             SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
@@ -631,6 +645,7 @@ SSL_CTX *make_ctx(const char *pemfile) {
         exit(1);
     }
 
+#ifdef USE_SHARED_CACHE
     rsa = load_rsa_privatekey(ctx, pemfile);
     if (!rsa) {
        ERR("Error loading rsa private key\n");
@@ -641,6 +656,12 @@ SSL_CTX *make_ctx(const char *pemfile) {
         ERR_print_errors_fp(stderr);
         exit(1);
     }
+#else
+    if (SSL_CTX_use_RSAPrivateKey_file(ctx, pemfile, SSL_FILETYPE_PEM) <= 0) {
+       ERR("Error loading rsa private key\n");
+       exit(1);
+    }
+#endif
 
 #ifndef OPENSSL_NO_DH
     init_dh(ctx, pemfile);
@@ -672,9 +693,9 @@ SSL_CTX *make_ctx(const char *pemfile) {
             }
         }
     }
+    RSA_free(rsa);
 #endif
 
-    RSA_free(rsa);
     return ctx;
 }
 
@@ -756,6 +777,10 @@ void init_openssl() {
 #endif /* OPENSSL_NO_TLSEXT */
 
     if (CONFIG->ENGINE) {
+#ifdef USE_WOLFSSL
+        ERR("ENGINE API is not implemented in WolfSSL\n");
+        exit(1);
+#else
         ENGINE *e = NULL;
         ENGINE_load_builtin_engines();
         if (!strcmp(CONFIG->ENGINE, "auto"))
@@ -771,6 +796,7 @@ void init_openssl() {
             ENGINE_finish(e);
             ENGINE_free(e);
         }
+#endif
     }
 }
 
@@ -1058,10 +1084,12 @@ static void end_handshake(proxystate *ps) {
     ev_io_stop(loop, &ps->ev_r_handshake);
     ev_io_stop(loop, &ps->ev_w_handshake);
 
+#ifndef USE_WOLFSSL
     /* Disable renegotiation (CVE-2009-3555) */
     if (ps->ssl->s3) {
         ps->ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
     }
+#endif
     ps->handshaked = 1;
 
     /* Check if clear side is connected */
@@ -1134,10 +1162,10 @@ static void client_proxy_proxy(struct ev_loop *loop, ev_io *w, int revents) {
     int t;
     char *proxy = tcp_proxy_line, *end = tcp_proxy_line + sizeof(tcp_proxy_line);
     proxystate *ps = (proxystate *)w->data;
-    BIO *b = SSL_get_rbio(ps->ssl);
+    SSL *s = ps->ssl;
 
     // Copy characters one-by-one until we hit a \n or an error
-    while (proxy != end && (t = BIO_read(b, proxy, 1)) == 1) {
+    while (proxy != end && (t = SSL_read(s, proxy, 1)) == 1) {
         if (*proxy++ == '\n') break;
     }
 
@@ -1164,8 +1192,8 @@ static void client_proxy_proxy(struct ev_loop *loop, ev_io *w, int revents) {
             start_handshake(ps, SSL_ERROR_WANT_READ);
         }
     }
-    else if (!BIO_should_retry(b)) {
-        LOG("{client} Unexpected error reading PROXY line");
+    else if (t < 0) {
+        LOG("{client} Unexpected error %d reading PROXY line", t);
         shutdown_proxy(ps, SHUTDOWN_SSL);
     }
 }
@@ -1178,7 +1206,11 @@ static void client_handshake(struct ev_loop *loop, ev_io *w, int revents) {
     int t;
     proxystate *ps = (proxystate *)w->data;
 
+#ifdef USE_WOLFSSL
+    t = wolfSSL_negotiate(ps->ssl);
+#else
     t = SSL_do_handshake(ps->ssl);
+#endif
     if (t == 1) {
         end_handshake(ps);
     }
@@ -1348,7 +1380,7 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
 #ifdef SSL_MODE_RELEASE_BUFFERS
     mode |= SSL_MODE_RELEASE_BUFFERS;
 #endif
-    SSL_set_mode(ssl, mode);
+    SSL_CTX_set_mode(ctx, mode);
     SSL_set_accept_state(ssl);
     SSL_set_fd(ssl, client);
 
@@ -1465,7 +1497,7 @@ static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
 #ifdef SSL_MODE_RELEASE_BUFFERS
     mode |= SSL_MODE_RELEASE_BUFFERS;
 #endif
-    SSL_set_mode(ssl, mode);
+    SSL_CTX_set_mode(ctx, mode);
     SSL_set_connect_state(ssl);
     SSL_set_fd(ssl, back);
     if (client_session)

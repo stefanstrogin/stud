@@ -76,7 +76,11 @@ static char error_buf[CONFIG_BUF_SIZE];
 static char tmp_buf[150];
 
 // for testing configuration only
+#ifdef USE_WOLFSSL
+#include <wolfssl/openssl/ssl.h>
+#else
 #include <openssl/ssl.h>
+#endif
 SSL_CTX * init_openssl();
 
 static void config_error_set (char *fmt, ...) {
