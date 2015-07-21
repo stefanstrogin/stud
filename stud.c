@@ -1375,6 +1375,9 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     }
 
     SSL_CTX * ctx = (SSL_CTX *)w->data;
+#ifdef USE_WOLFSSL
+    wolfSSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0);
+#endif
     SSL *ssl = SSL_new(ctx);
     long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
 #ifdef SSL_MODE_RELEASE_BUFFERS
@@ -1492,6 +1495,9 @@ static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
     }
 
     SSL_CTX * ctx = (SSL_CTX *)w->data;
+#ifdef USE_WOLFSSL
+    wolfSSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0);
+#endif
     SSL *ssl = SSL_new(ctx);
     long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
 #ifdef SSL_MODE_RELEASE_BUFFERS
