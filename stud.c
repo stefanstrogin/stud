@@ -57,16 +57,26 @@
 #include <wolfssl/openssl/ssl.h>
 #include <wolfssl/openssl/x509.h>
 #include <wolfssl/openssl/x509v3.h>
-#include <wolfssl/openssl/x509.h>
 #include <wolfssl/openssl/err.h>
 #include <wolfssl/openssl/engine.h>
 #include <wolfssl/openssl/crypto.h>
 #include <wolfssl/openssl/opensslv.h>
+#elif USE_MBEDTLS
+#include <mbedtls/ssl.h>
+#include <mbedtls/net.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/error.h>
+#include <mbedtls/asn1.h>
+#include <mbedtls/ssl_internal.h>
+#include <mbedtls/version.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/debug.h>
+#include "mbedtls.h"
 #else
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
-#include <openssl/x509.h>
 #include <openssl/err.h>
 #include <openssl/engine.h>
 #include <openssl/asn1.h>
@@ -75,8 +85,11 @@
 #include <ev.h>
 
 #include "ringbuffer.h"
-#include "shctx.h"
 #include "configuration.h"
+
+#ifdef USE_SHARED_CACHE
+#include "shctx.h"
+#endif
 
 #ifndef MSG_NOSIGNAL
 # define MSG_NOSIGNAL 0
@@ -110,8 +123,18 @@ static ev_io listener;
 static int listener_socket;
 static int child_num;
 static pid_t *child_pids;
+#ifdef USE_MBEDTLS
+static mbedtls_ssl_config default_conf;
+static mbedtls_ssl_session client_session;
+static int force_ciphersuite[2];
+mbedtls_x509_crt cert;
+mbedtls_pk_context pkey;
+mbedtls_ctr_drbg_context ctr_drbg;
+mbedtls_entropy_context entropy;
+#else
 static SSL_CTX *default_ctx;
 static SSL_SESSION *client_session;
+#endif
 
 #ifdef USE_SHARED_CACHE
 static ev_io shcupd_listener;
@@ -199,6 +222,23 @@ typedef struct proxystate {
 
 #define NULL_DEV "/dev/null"
 
+#ifdef USE_MBEDTLS
+static void my_debug( void *ctx, int level,
+                      const char *file, int line,
+                      const char *str )
+{
+    const char *p, *basename;
+
+    /* Extract basename from file */
+    for( p = basename = file; *p != '\0'; p++ )
+        if( *p == '/' || *p == '\\' )
+            basename = p + 1;
+
+    fprintf( (FILE *) ctx, "%s:%04d: |%d| %s", basename, line, level, str );
+    fflush(  (FILE *) ctx  );
+}
+#endif
+
 /* Set a file descriptor (socket) to non-blocking mode */
 static void setnonblocking(int fd) {
     int flag = 1;
@@ -277,6 +317,7 @@ static int init_dh(SSL_CTX *ctx, const char *cert) {
 }
 #endif /* OPENSSL_NO_DH */
 
+#ifndef USE_MBEDTLS
 /* This callback function is executed while OpenSSL processes the SSL
  * handshake and does SSL record layer stuff.  It's used to trap
  * client-initiated renegotiations.
@@ -291,6 +332,7 @@ static void info_callback(const SSL *ssl, int where, int ret) {
         }
     }
 }
+#endif /* USE_OPENSSL */
 
 #ifdef USE_SHARED_CACHE
 
@@ -547,6 +589,9 @@ static int create_shcupd_socket() {
     return s;
 }
 
+
+#ifdef USE_MBEDTLS
+#else
 RSA *load_rsa_privatekey(SSL_CTX *ctx, const char *file) {
     BIO *bio;
     RSA *rsa;
@@ -563,7 +608,7 @@ RSA *load_rsa_privatekey(SSL_CTX *ctx, const char *file) {
 
     return rsa;
 }
-
+#endif /* USE_MBEDTLS */
 #endif /*USE_SHARED_CACHE */
 
 #ifndef OPENSSL_NO_TLSEXT
@@ -598,6 +643,63 @@ int sni_switch_ctx(SSL *ssl, int *al, void *data) {
  * Initialize an SSL context
  */
 
+#ifdef USE_MBEDTLS
+mbedtls_ssl_config make_ctx(const char *pemfile) {
+    mbedtls_ssl_config conf;
+    int err;
+
+    mbedtls_ssl_config_init(&conf);
+    mbedtls_ssl_config_defaults(&conf, (CONFIG->PMODE == SSL_CLIENT) ?
+		    MBEDTLS_SSL_IS_CLIENT : MBEDTLS_SSL_IS_SERVER,
+		    MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (CONFIG->ETYPE == ENC_SSL)
+        conf.min_minor_ver = MBEDTLS_SSL_MINOR_VERSION_0;
+    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+    mbedtls_debug_set_threshold(0);
+
+    assert(CONFIG->ETYPE == ENC_TLS || CONFIG->ETYPE == ENC_SSL);
+
+    if (CONFIG->CIPHER_SUITE) {
+	force_ciphersuite[0] = mbedtls_ssl_get_ciphersuite_id(CONFIG->CIPHER_SUITE);
+	if(force_ciphersuite[0] == 0)
+	{
+	     ERR("Error setting ciphersuit\n");
+             exit(1);
+	}
+	force_ciphersuite[1] = 0;
+        mbedtls_ssl_conf_ciphersuites(&conf, force_ciphersuite);
+    }
+
+    mbedtls_ssl_conf_rng( &conf, mbedtls_ctr_drbg_random, &ctr_drbg );
+
+    if (CONFIG->PMODE == SSL_CLIENT)
+        return conf;
+
+    /* SSL_SERVER Mode stuff */
+    mbedtls_x509_crt_init(&cert);
+    err = mbedtls_x509_crt_parse_file(&cert, pemfile);
+    if (err) {
+        ERR("Error parsing certificate file: %d\n", err);
+        exit(1);
+    }
+
+    mbedtls_ssl_conf_ca_chain(&conf, &cert, NULL);
+
+    mbedtls_pk_init(&pkey);
+    err = mbedtls_pk_parse_keyfile(&pkey, pemfile, NULL);
+    if (err) {
+        ERR("Error! mbedtls_pk_parse_keyfile returned: %d\n", err);
+	exit(1);
+    }
+    err = mbedtls_ssl_conf_own_cert(&conf, &cert, &pkey);
+    if (err) {
+        ERR("Error! mbedtls_ssl_conf_own_cert returned %d\n", err);
+	exit(1);
+    }
+
+    return conf;
+}
+#else
 SSL_CTX *make_ctx(const char *pemfile) {
     SSL_CTX *ctx;
 #ifdef USE_SHARED_CACHE
@@ -698,19 +800,35 @@ SSL_CTX *make_ctx(const char *pemfile) {
 
     return ctx;
 }
+#endif /* USE_MBEDTLS */
 
 /* Init library and load specified certificate.
  * Establishes a SSL_ctx, to act as a template for
  * each connection */
 void init_openssl() {
+#ifndef USE_MBEDTLS
     SSL_library_init();
     SSL_load_error_strings();
+#endif
 
     assert(CONFIG->CERT_FILES != NULL);
 
     // The first file (i.e., the last file listed in config) is always the
     // "default" cert
+#ifdef USE_MBEDTLS
+    default_conf = make_ctx(CONFIG->CERT_FILES->CERT_FILE);
+    mbedtls_ssl_conf_dbg(&default_conf, my_debug, stdout);
+    mbedtls_ctr_drbg_init(&ctr_drbg);
+    mbedtls_entropy_init(&entropy);
+    int ret;
+    const char *pers = "ssl_client2";    
+    if( ( ret = mbedtls_ctr_drbg_seed( &ctr_drbg, mbedtls_entropy_func, &entropy,
+                               (const unsigned char *) pers,
+                               strlen( pers ) ) ) != 0 )
+	return;
+#else
     default_ctx = make_ctx(CONFIG->CERT_FILES->CERT_FILE);
+#endif
 
 #ifndef OPENSSL_NO_TLSEXT
     {
@@ -777,8 +895,8 @@ void init_openssl() {
 #endif /* OPENSSL_NO_TLSEXT */
 
     if (CONFIG->ENGINE) {
-#ifdef USE_WOLFSSL
-        ERR("ENGINE API is not implemented in WolfSSL\n");
+#ifndef USE_OPENSSL
+        ERR("ENGINE API is not implemented\n");
         exit(1);
 #else
         ENGINE *e = NULL;
@@ -915,8 +1033,13 @@ static void shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req) {
         close(ps->fd_up);
         close(ps->fd_down);
 
+#ifdef USE_MBEDTLS
+	mbedtls_ssl_close_notify(ps->ssl);
+	mbedtls_ssl_free(ps->ssl);
+#else
         SSL_set_shutdown(ps->ssl, SSL_SENT_SHUTDOWN);
         SSL_free(ps->ssl);
+#endif
 
         free(ps);
     }
@@ -1084,7 +1207,7 @@ static void end_handshake(proxystate *ps) {
     ev_io_stop(loop, &ps->ev_r_handshake);
     ev_io_stop(loop, &ps->ev_w_handshake);
 
-#ifndef USE_WOLFSSL
+#ifdef USE_OPENSSL
     /* Disable renegotiation (CVE-2009-3555) */
     if (ps->ssl->s3) {
         ps->ssl->s3->flags |= SSL3_FLAGS_NO_RENEGOTIATE_CIPHERS;
@@ -1140,11 +1263,19 @@ static void end_handshake(proxystate *ps) {
     }
     else {
         /* stud used in client mode, keep client session ) */
+#ifdef USE_MBEDTLS
+        /* TODO: how to know that in mbedtls? */
+        //if (!ps->ssl-> == ) {
+	//    mbedtls_ssl_session_free(&client_session);
+	//    mbedtls_ssl_get_session(ps->ssl, &client_session);
+	//}
+#else
         if (!SSL_session_reused(ps->ssl)) {
             if (client_session)
                 SSL_SESSION_free(client_session);
-            client_session = SSL_get1_session(ps->ssl);
+            client_session = SSL_get_session(ps->ssl);
         }
+#endif
     }
 
     /* if incoming buffer is not full */
@@ -1155,6 +1286,7 @@ static void end_handshake(proxystate *ps) {
     if (!ringbuffer_is_empty(&ps->ring_clear2ssl))
         // not safe.. we want to resume stream even during half-closed
         ev_io_start(loop, &ps->ev_w_ssl);
+
 }
 
 static void client_proxy_proxy(struct ev_loop *loop, ev_io *w, int revents) {
@@ -1165,7 +1297,7 @@ static void client_proxy_proxy(struct ev_loop *loop, ev_io *w, int revents) {
     SSL *s = ps->ssl;
 
     // Copy characters one-by-one until we hit a \n or an error
-    while (proxy != end && (t = SSL_read(s, proxy, 1)) == 1) {
+    while (proxy != end && (t = SSL_read(s, (unsigned char *) proxy, 1)) == 1) {
         if (*proxy++ == '\n') break;
     }
 
@@ -1211,11 +1343,19 @@ static void client_handshake(struct ev_loop *loop, ev_io *w, int revents) {
 #else
     t = SSL_do_handshake(ps->ssl);
 #endif
+#ifdef USE_MBEDTLS
+    if (t == 0) {
+        end_handshake(ps);
+    }
+    else {
+        int err = t;
+#else
     if (t == 1) {
         end_handshake(ps);
     }
     else {
         int err = SSL_get_error(ps->ssl, t);
+#endif
         if (err == SSL_ERROR_WANT_READ) {
             ev_io_stop(loop, &ps->ev_w_handshake);
             ev_io_start(loop, &ps->ev_r_handshake);
@@ -1239,11 +1379,13 @@ static void client_handshake(struct ev_loop *loop, ev_io *w, int revents) {
 static void handle_fatal_ssl_error(proxystate *ps, int err, int backend) {
     if (err == SSL_ERROR_ZERO_RETURN)
         ERR("{%s} Connection closed (in data)\n", backend ? "backend" : "client");
+#ifndef USE_MBEDTLS
     else if (err == SSL_ERROR_SYSCALL)
         if (errno == 0)
             ERR("{%s} Connection closed (in data)\n", backend ? "backend" : "client");
         else
             perror(backend ? "{backend} [errno] " : "{client} [errno] ");
+#endif
     else
         ERR("{%s} Unexpected SSL_read error: %d\n", backend ? "backend" : "client" , err);
     shutdown_proxy(ps, SHUTDOWN_SSL);
@@ -1260,7 +1402,7 @@ static void ssl_read(struct ev_loop *loop, ev_io *w, int revents) {
         return;
     }
     char * buf = ringbuffer_write_ptr(&ps->ring_ssl2clear);
-    t = SSL_read(ps->ssl, buf, RING_DATA_LEN);
+    t = SSL_read(ps->ssl, (unsigned char *)buf, RING_DATA_LEN);
 
     /* Fix CVE-2009-3555. Disable reneg if started by client. */
     if (ps->renegotiation) {
@@ -1276,7 +1418,11 @@ static void ssl_read(struct ev_loop *loop, ev_io *w, int revents) {
             safe_enable_io(ps, &ps->ev_w_clear);
     }
     else {
+#ifdef USE_MBEDTLS
+        int err = t;
+#else
         int err = SSL_get_error(ps->ssl, t);
+#endif
         if (err == SSL_ERROR_WANT_WRITE) {
             start_handshake(ps, err);
         }
@@ -1295,7 +1441,7 @@ static void ssl_write(struct ev_loop *loop, ev_io *w, int revents) {
     proxystate *ps = (proxystate *)w->data;
     assert(!ringbuffer_is_empty(&ps->ring_clear2ssl));
     char * next = ringbuffer_read_next(&ps->ring_clear2ssl, &sz);
-    t = SSL_write(ps->ssl, next, sz);
+    t = SSL_write(ps->ssl, (unsigned char *)next, sz);
     if (t > 0) {
         if (t == sz) {
             ringbuffer_read_pop(&ps->ring_clear2ssl);
@@ -1314,7 +1460,11 @@ static void ssl_write(struct ev_loop *loop, ev_io *w, int revents) {
         }
     }
     else {
+#ifdef USE_MBEDTLS
+	int err = t;
+#else
         int err = SSL_get_error(ps->ssl, t);
+#endif
         if (err == SSL_ERROR_WANT_READ) {
             start_handshake(ps, err);
         }
@@ -1350,6 +1500,10 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
         return;
     }
 
+#ifdef USE_MBEDTLS
+    static mbedtls_net_context client_fd;
+    client_fd.fd = client;
+#endif
     int flag = 1;
     int ret = setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag) );
     if (ret == -1) {
@@ -1378,14 +1532,27 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
 #ifdef USE_WOLFSSL
     wolfSSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0);
 #endif
+
+#ifdef USE_MBEDTLS
+    SSL *ssl = malloc(sizeof(SSL));
+    mbedtls_ssl_init(ssl);
+    mbedtls_ssl_setup(ssl, ctx);
+#else
     SSL *ssl = SSL_new(ctx);
     long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
 #ifdef SSL_MODE_RELEASE_BUFFERS
     mode |= SSL_MODE_RELEASE_BUFFERS;
 #endif
     SSL_CTX_set_mode(ctx, mode);
+#endif
+
+#ifdef USE_MBEDTLS
+    mbedtls_ssl_set_bio(ssl, &client_fd,
+			mbedtls_net_send, mbedtls_net_recv, NULL);
+#else
     SSL_set_accept_state(ssl);
     SSL_set_fd(ssl, client);
+#endif
 
     proxystate *ps = (proxystate *)malloc(sizeof(proxystate));
 
@@ -1423,8 +1590,10 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->ev_r_handshake.data = ps;
     ps->ev_w_handshake.data = ps;
 
+#ifdef USE_OPENSSL
     /* Link back proxystate to SSL state */
     SSL_set_app_data(ssl, ps);
+#endif
 
     if (CONFIG->PROXY_PROXY_LINE) {
         ev_io_start(loop, &ps->ev_proxy);
@@ -1494,10 +1663,24 @@ static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
         return;
     }
 
+#ifdef USE_MBEDTLS
+    static mbedtls_net_context back_fd;
+    back_fd.fd = back;
+#endif
+
     SSL_CTX * ctx = (SSL_CTX *)w->data;
 #ifdef USE_WOLFSSL
     wolfSSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, 0);
 #endif
+
+#ifdef USE_MBEDTLS
+    SSL *ssl = malloc(sizeof(SSL));
+    mbedtls_ssl_init(ssl);
+    mbedtls_ssl_setup(ssl, ctx);
+    mbedtls_ssl_set_session(ssl, &client_session);
+    mbedtls_ssl_set_bio(ssl, &back_fd,
+			mbedtls_net_send, mbedtls_net_recv, NULL);
+#else
     SSL *ssl = SSL_new(ctx);
     long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
 #ifdef SSL_MODE_RELEASE_BUFFERS
@@ -1506,8 +1689,10 @@ static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
     SSL_CTX_set_mode(ctx, mode);
     SSL_set_connect_state(ssl);
     SSL_set_fd(ssl, back);
+
     if (client_session)
         SSL_set_session(ssl, client_session);
+#endif
 
     proxystate *ps = (proxystate *)malloc(sizeof(proxystate));
 
@@ -1543,8 +1728,10 @@ static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->ev_r_handshake.data = ps;
     ps->ev_w_handshake.data = ps;
 
+#ifdef USE_OPENSSL
     /* Link back proxystate to SSL state */
     SSL_set_app_data(ssl, ps);
+#endif
 
     ev_io_start(loop, &ps->ev_r_clear);
     start_connect(ps); /* start connect */
@@ -1578,7 +1765,11 @@ static void handle_connections() {
     ev_timer_start(loop, &timer_ppid_check);
 
     ev_io_init(&listener, (CONFIG->PMODE == SSL_CLIENT) ? handle_clear_accept : handle_accept, listener_socket, EV_READ);
+#ifdef USE_MBEDTLS
+    listener.data = &default_conf;
+#else
     listener.data = default_ctx;
+#endif
     ev_io_start(loop, &listener);
 
     ev_loop(loop, 0);
@@ -1825,6 +2016,7 @@ void openssl_check_version() {
     /* detect OpenSSL version in runtime */
     openssl_version = SSLeay();
 
+#ifdef USE_OPENSSL
     /* check if we're running the same openssl that we were */
     /* compiled with */
     if ((openssl_version ^ OPENSSL_VERSION_NUMBER) & ~0xff0L) {
@@ -1836,6 +2028,7 @@ void openssl_check_version() {
         /* now what? exit now? */
         /* exit(1); */
     }
+#endif
 
     LOG("{core} Using OpenSSL version %lx.\n", (unsigned long int) openssl_version);
 }

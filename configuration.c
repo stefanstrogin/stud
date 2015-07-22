@@ -78,6 +78,9 @@ static char tmp_buf[150];
 // for testing configuration only
 #ifdef USE_WOLFSSL
 #include <wolfssl/openssl/ssl.h>
+#elif USE_MBEDTLS
+#include <mbedtls/ssl.h>
+#include "mbedtls.h"
 #else
 #include <openssl/ssl.h>
 #endif

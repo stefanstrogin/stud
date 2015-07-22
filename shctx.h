@@ -11,6 +11,8 @@
 #define SHCTX_H
 #ifdef USE_WOLFSSL
 #include <wolfssl/openssl/ssl.h>
+#elif USE_MBEDTLS
+#include <mbedtls/ssl.h>
 #else
 #include <openssl/ssl.h>
 #endif

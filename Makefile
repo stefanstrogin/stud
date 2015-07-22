@@ -8,15 +8,20 @@ BINDIR  = $(PREFIX)/bin
 MANDIR  = $(PREFIX)/share/man
 # WolfSSL should be built with --enable-lighty and --enable-opensslextra
 #LIBSSL = wolfssl
+#LIBSSL = mbedtls
 
 CFLAGS  = -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -D_GNU_SOURCE -I/usr/local/include 
 LDFLAGS = -lev -L/usr/local/lib
 OBJS    = stud.o ringbuffer.o configuration.o
 
 ifeq ($(LIBSSL),wolfssl)
-LDFLAGS += -lwolfssl
-CFLAGS += -DOPENSSL_NO_DH -DHAVE_LIGHTY -DOPENSSL_EXTRA -DUSE_WOLFSSL
+LDFLAGS += -lwolfssl -L$(PWD)/../wolfssl/root/lib
+CFLAGS += -DOPENSSL_NO_DH -DHAVE_LIGHTY -DOPENSSL_EXTRA -DUSE_WOLFSSL -I$(PWD)/../wolfssl/root/include
+else ifeq ($(LIBSSL),mbedtls)
+LDFLAGS += -lmbedtls -lmbedx509 -lmbedcrypto -L$(PWD)/../mbedtls/root/lib
+CFLAGS += -DOPENSSL_NO_DH -DUSE_MBEDTLS -I$(PWD)/../mbedtls/root/include
 else
+CFLAGS += -DUSE_OPENSSL
 LDFLAGS += -lssl -lcrypto
 endif
 
