@@ -9,6 +9,7 @@ MANDIR  = $(PREFIX)/share/man
 # WolfSSL should be built with --enable-lighty and --enable-opensslextra
 #LIBSSL = wolfssl
 #LIBSSL = mbedtls
+BENCHMARK = 1
 
 CFLAGS  = -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -D_GNU_SOURCE -I/usr/local/include 
 LDFLAGS = -lev -L/usr/local/lib
@@ -23,6 +24,10 @@ CFLAGS += -DOPENSSL_NO_DH -DUSE_MBEDTLS -I$(PWD)/../mbedtls/root/include
 else
 CFLAGS += -DUSE_OPENSSL
 LDFLAGS += -lssl -lcrypto
+endif
+
+ifneq ($(BENCHMARK),)
+CFLAGS += -DBENCHMARK
 endif
 
 

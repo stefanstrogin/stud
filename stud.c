@@ -87,6 +87,8 @@
 #include "ringbuffer.h"
 #include "configuration.h"
 
+#include <sys/time.h>
+
 #ifdef USE_SHARED_CACHE
 #include "shctx.h"
 #endif
@@ -686,7 +688,7 @@ mbedtls_ssl_config make_ctx(const char *pemfile) {
     mbedtls_ssl_conf_ca_chain(&conf, &cert, NULL);
 
     mbedtls_pk_init(&pkey);
-    err = mbedtls_pk_parse_keyfile(&pkey, pemfile, NULL);
+    err = mbedtls_pk_parse_keyfile(&pkey, "my.key", NULL);
     if (err) {
         ERR("Error! mbedtls_pk_parse_keyfile returned: %d\n", err);
 	exit(1);
@@ -759,7 +761,7 @@ SSL_CTX *make_ctx(const char *pemfile) {
         exit(1);
     }
 #else
-    if (SSL_CTX_use_RSAPrivateKey_file(ctx, pemfile, SSL_FILETYPE_PEM) <= 0) {
+    if (SSL_CTX_use_RSAPrivateKey_file(ctx, "my.key", SSL_FILETYPE_PEM) <= 0) {
        ERR("Error loading rsa private key\n");
        exit(1);
     }
@@ -821,7 +823,7 @@ void init_openssl() {
     mbedtls_ctr_drbg_init(&ctr_drbg);
     mbedtls_entropy_init(&entropy);
     int ret;
-    const char *pers = "ssl_client2";    
+    const char *pers = "ssl_client2";
     if( ( ret = mbedtls_ctr_drbg_seed( &ctr_drbg, mbedtls_entropy_func, &entropy,
                                (const unsigned char *) pers,
                                strlen( pers ) ) ) != 0 )
@@ -1063,8 +1065,8 @@ static void handle_socket_errno(proxystate *ps, int backend) {
         ERR("{%s} Connection to backend timed out\n", backend ? "backend" : "client");
     else if (errno == EPIPE)
         ERR("{%s} Broken pipe to backend (EPIPE)\n", backend ? "backend" : "client");
-    else
-        perror("{backend} [errno]");
+//    else
+//        perror("{backend} [errno]");
     shutdown_proxy(ps, SHUTDOWN_CLEAR);
 }
 /* Start connect to backend */
@@ -1149,6 +1151,16 @@ static void clear_write(struct ev_loop *loop, ev_io *w, int revents) {
 
 static void start_handshake(proxystate *ps, int err);
 
+#ifdef BENCHMARK
+static void handle_connect(struct ev_loop *loop, ev_io *w, int revents) {
+    (void) revents;
+    proxystate *ps = (proxystate *)w->data;
+
+    ev_io_stop(loop, &ps->ev_w_connect);
+    if (!ps->clear_connected)
+        ps->clear_connected = 1;
+}
+#else
 /* Continue/complete the asynchronous connect() before starting data transmission
  * between front/backend */
 static void handle_connect(struct ev_loop *loop, ev_io *w, int revents) {
@@ -1184,6 +1196,7 @@ static void handle_connect(struct ev_loop *loop, ev_io *w, int revents) {
         shutdown_proxy(ps, SHUTDOWN_HARD);
     }
 }
+#endif /* BENCHMARK */
 
 /* Upon receiving a signal from OpenSSL that a handshake is required, re-wire
  * the read/write events to hook up to the handshake handlers */
@@ -1401,8 +1414,17 @@ static void ssl_read(struct ev_loop *loop, ev_io *w, int revents) {
         ev_io_stop(loop, &ps->ev_r_ssl);
         return;
     }
+#ifdef BENCHMARK
+    struct timeval tv1, tv2;
+    gettimeofday(&tv1, NULL);
+#endif
     char * buf = ringbuffer_write_ptr(&ps->ring_ssl2clear);
     t = SSL_read(ps->ssl, (unsigned char *)buf, RING_DATA_LEN);
+#ifdef BENCHMARK
+    gettimeofday(&tv2, NULL);
+    printf("ssl_read() %ld usec\n", ((tv2.tv_sec * 1000000 + tv2.tv_usec)
+		  - (tv1.tv_sec * 1000000 + tv1.tv_usec)));
+#endif
 
     /* Fix CVE-2009-3555. Disable reneg if started by client. */
     if (ps->renegotiation) {
@@ -1590,7 +1612,7 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->ev_r_handshake.data = ps;
     ps->ev_w_handshake.data = ps;
 
-#ifdef USE_OPENSSL
+#ifndef USE_MBEDTLS
     /* Link back proxystate to SSL state */
     SSL_set_app_data(ssl, ps);
 #endif
@@ -1728,7 +1750,7 @@ static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->ev_r_handshake.data = ps;
     ps->ev_w_handshake.data = ps;
 
-#ifdef USE_OPENSSL
+#ifndef USE_MBEDTLS
     /* Link back proxystate to SSL state */
     SSL_set_app_data(ssl, ps);
 #endif
